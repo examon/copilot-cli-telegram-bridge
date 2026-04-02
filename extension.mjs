@@ -1286,31 +1286,6 @@ async function main() {
     session = await joinSession({
         onUserInputRequest: createUserInputHandler(),
         hooks: {
-            onSessionStart: () => {
-                registry = loadJsonOrDefault(BOTS_REGISTRY_PATH, {});
-                const names = Object.keys(registry);
-
-                let status;
-                let botsBlock = "";
-                if (names.length === 0) {
-                    status = "No bots registered. Use /telegram setup <name> to add one.";
-                } else {
-                    status = `${names.length} bot(s) registered. Use /telegram connect <name> to start.`;
-                    const botLines = formatBotLines(registry);
-                    botsBlock = "\nRegistered bots:\n" + botLines.join("\n");
-                }
-
-                return {
-                    additionalContext:
-                        `[Telegram Bridge Extension]\n` +
-                        `Extension directory: ${EXT_DIR}\n` +
-                        `Status: ${status}` +
-                        botsBlock + "\n" +
-                        `Registry: ${BOTS_REGISTRY_PATH}\n` +
-                        `Access control: ${ACCESS_PATH}\n` +
-                        `README: ${join(EXT_DIR, "README.md")}`,
-                };
-            },
             onUserPromptSubmitted: (input) => {
                 if (!pendingSetupName) return;
                 const prompt = input.prompt.trim();
