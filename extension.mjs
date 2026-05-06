@@ -425,9 +425,17 @@ async function handlePairing(chatId, userId, text) {
                 access.allowedUsers.push(userIdStr);
             }
             delete access.pending[chatIdStr];
-            saveJsonAtomic(ACCESS_PATH, access);
-            await enqueue(() => sendMessage(chatId, "Paired! You can now send messages to Copilot CLI."));
-            await session.log(`Telegram user ${userIdStr} paired successfully.`);
+            // Auto-lock after the first user pairs so the bot is secure by default
+            if (!access.locked && access.allowedUsers.length === 1) {
+                access.locked = true;
+                saveJsonAtomic(ACCESS_PATH, access);
+                await enqueue(() => sendMessage(chatId, "Paired! You can now send messages to Copilot CLI."));
+                await session.log(`Telegram user ${userIdStr} paired successfully. Pairing is now locked (only you can use this bot). To allow others: /telegram unlock`);
+            } else {
+                saveJsonAtomic(ACCESS_PATH, access);
+                await enqueue(() => sendMessage(chatId, "Paired! You can now send messages to Copilot CLI."));
+                await session.log(`Telegram user ${userIdStr} paired successfully.`);
+            }
             return;
         } else {
             await enqueue(() => sendMessage(chatId, "Invalid code. Try again."));
@@ -719,6 +727,7 @@ async function processUpdate(update) {
     }
 
     if (!isAllowed(userIdStr)) {
+        if (access.locked) return;
         await handlePairing(chatId, userId, text);
         return;
     }
@@ -1179,8 +1188,18 @@ async function handleTelegramCommand(args, sessionId) {
         case "remove":
             await handleRemove(botName, sessionId);
             break;
+        case "lock":
+            access.locked = true;
+            saveJsonAtomic(ACCESS_PATH, access);
+            await session.log("Pairing locked. No new users can pair until you run /telegram unlock.");
+            break;
+        case "unlock":
+            access.locked = false;
+            saveJsonAtomic(ACCESS_PATH, access);
+            await session.log("Pairing unlocked. New users can pair again.");
+            break;
         default:
-            await session.log("Available: /telegram setup|connect|disconnect|status|remove");
+            await session.log("Available: /telegram setup|connect|disconnect|status|remove|lock|unlock");
             break;
     }
 }
