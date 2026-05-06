@@ -67,6 +67,20 @@ A GitHub Copilot CLI extension that bridges Telegram messages bidirectionally wi
 | `/telegram disconnect` | Disconnect from the current bot |
 | `/telegram status` | Show all bots, availability, and paired users |
 | `/telegram remove <name>` | Remove a bot from the registry |
+| `/telegram lock` | Lock pairing (no new users can pair) |
+| `/telegram unlock` | Unlock pairing (allow new users to pair) |
+
+## Security
+
+After the first user pairs, pairing is **automatically locked** — no other Telegram user can initiate pairing unless you explicitly run `/telegram unlock`. This makes single-user setups secure by default.
+
+Already-paired users are unaffected by the lock and are recognized immediately across devices and session restarts.
+
+Bot tokens are stored **in plain text** in `bots.json` (with restricted file permissions -- owner read/write only). Anyone with read access to that file can control your bot. Keep this in mind:
+
+- Do not commit `bots.json` to version control
+- Do not share or back up the extension directory without removing `bots.json` first
+- If a token is compromised, revoke it immediately via @BotFather (`/revoke`) and register a new one with `/telegram setup`
 
 ## Multiple Bots
 
@@ -82,14 +96,6 @@ Access control is shared -- pairing with any bot grants access to all bots manag
 - **Bot not responding** -- check that the token is valid. Try `/telegram disconnect` then `/telegram connect` again
 - **Pairing code expired** -- codes expire after 5 minutes. Send a new message to the bot to get a fresh one
 - **"Another session has this bot"** -- the bot is locked by another CLI session. Connecting again takes it over
-
-## Security
-
-Bot tokens are stored **in plain text** in `bots.json` (with restricted file permissions -- owner read/write only). Anyone with read access to that file can control your bot. Keep this in mind:
-
-- Do not commit `bots.json` to version control
-- Do not share or back up the extension directory without removing `bots.json` first
-- If a token is compromised, revoke it immediately via @BotFather (`/revoke`) and register a new one with `/telegram setup`
 
 ## Uninstall
 
