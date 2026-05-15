@@ -6,6 +6,7 @@ import { joinSession } from "@github/copilot-sdk/extension";
 import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, renameSync } from "node:fs";
 import { join, basename } from "node:path";
 import { randomBytes } from "node:crypto";
+import { hostname, platform } from "node:os";
 
 // ============================================================
 // Section 1: Constants & Configuration
@@ -28,6 +29,7 @@ const PAIRING_EXPIRY_MS = 300000;
 const ERROR_RETRY_BASE_MS = 5000;
 const ERROR_RETRY_MAX_MS = 60000;
 const API_TIMEOUT_MS = 30000;
+const LOCK_STALE_AFTER_MS = (POLL_TIMEOUT + 45) * 1000;
 
 
 // ============================================================
@@ -365,29 +367,83 @@ function readLock(name) {
     return data;
 }
 
-function writeLock(name, sessionId) {
-    saveJsonAtomic(botLockPath(name), {
+function getProcessStartToken(pid) {
+    if (platform() !== "linux") return null;
+
+    try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+        const lastParen = stat.lastIndexOf(")");
+        if (lastParen === -1) return null;
+        const fields = stat.slice(lastParen + 2).trim().split(/\s+/);
+        const startTime = fields[19]; // Linux procfs starttime field.
+        return startTime ? `linux:${startTime}` : null;
+    } catch {
+        return null;
+    }
+}
+
+function createLockData(name, sessionId, connectedAt = new Date().toISOString()) {
+    return {
         pid: process.pid,
         sessionId,
-        connectedAt: new Date().toISOString(),
-    });
+        botName: name,
+        hostname: hostname(),
+        processStartToken: getProcessStartToken(process.pid),
+        processStartTokenSource: platform(),
+        connectedAt,
+        updatedAt: new Date().toISOString(),
+    };
+}
+
+function writeLock(name, sessionId) {
+    saveJsonAtomic(botLockPath(name), createLockData(name, sessionId));
+}
+
+function lockOwnedByCurrentProcess(lock, sessionId) {
+    if (!lock || lock.pid !== process.pid || lock.sessionId !== sessionId) return false;
+    if (lock.hostname && lock.hostname !== hostname()) return false;
+    if (lock.processStartToken) {
+        const currentStartToken = getProcessStartToken(lock.pid);
+        if (currentStartToken && currentStartToken !== lock.processStartToken) return false;
+    }
+    return true;
+}
+
+function refreshLock(name, sessionId) {
+    const lock = readLock(name);
+    if (!lockOwnedByCurrentProcess(lock, sessionId)) return false;
+    const connectedAt = lock.connectedAt || new Date().toISOString();
+    saveJsonAtomic(botLockPath(name), createLockData(name, sessionId, connectedAt));
+    return true;
 }
 
 function removeLock(name, sessionId) {
     const lock = readLock(name);
-    if (lock && lock.sessionId === sessionId) {
+    if (lockOwnedByCurrentProcess(lock, sessionId)) {
         try { rmSync(botLockPath(name), { force: true }); } catch {}
     }
 }
 
 function isLockStale(lock) {
     if (!lock) return true;
+
     try {
         process.kill(lock.pid, 0);
-        return false;
     } catch {
         return true;
     }
+
+    if (lock.hostname && lock.hostname !== hostname()) return false;
+
+    if (lock.processStartToken) {
+        const currentStartToken = getProcessStartToken(lock.pid);
+        if (currentStartToken && currentStartToken !== lock.processStartToken) return true;
+    }
+
+    const updatedAt = Date.parse(lock.updatedAt || lock.connectedAt || "");
+    if (!Number.isFinite(updatedAt)) return true;
+
+    return Date.now() - updatedAt > LOCK_STALE_AFTER_MS;
 }
 
 // ============================================================
@@ -969,8 +1025,9 @@ async function handleConnect(name, sessionId) {
 
     // Check lock -- if another live session holds it, take over (Telegram 409 will release them)
     const lock = readLock(name);
+    const staleLock = lock && isLockStale(lock) ? lock : null;
     let tookOverFrom = null;
-    if (lock && !isLockStale(lock) && lock.sessionId !== sessionId) {
+    if (lock && !staleLock && lock.sessionId !== sessionId) {
         tookOverFrom = lock.sessionId;
     }
 
@@ -994,6 +1051,9 @@ async function handleConnect(name, sessionId) {
 
     // Claim lock and connect
     mkdirSync(botDir(name), { recursive: true });
+    if (staleLock?.sessionId) {
+        await session.log(`Replacing stale Telegram bridge lock from session ${staleLock.sessionId}.`);
+    }
     writeLock(name, sessionId);
     currentBotName = name;
     currentSessionId = sessionId;
@@ -1224,6 +1284,9 @@ async function pollLoop() {
         try {
             const updates = await getUpdates(state.offset, POLL_TIMEOUT);
             errorDelay = ERROR_RETRY_BASE_MS;
+            if (currentBotName && currentSessionId) {
+                refreshLock(currentBotName, currentSessionId);
+            }
 
             for (const update of updates) {
                 try {
@@ -1347,14 +1410,13 @@ async function main() {
     }
 }
 
-// SIGTERM handler
-process.on("SIGTERM", async () => {
+async function shutdown(signalOrReason, exitCode = 0) {
     shutdownRequested = true;
     if (abortController) abortController.abort();
 
     if (connected) {
         const lock = currentBotName ? readLock(currentBotName) : null;
-        const weOwnLock = lock && lock.pid === process.pid;
+        const weOwnLock = lockOwnedByCurrentProcess(lock, currentSessionId);
 
         if (weOwnLock) {
             try {
@@ -1377,7 +1439,31 @@ process.on("SIGTERM", async () => {
 
     stopTyping();
     cleanupTmpDir();
-    process.exit(0);
+    process.exit(exitCode);
+}
+
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.on(signal, () => {
+        shutdown(signal).catch(err => {
+            console.error(`telegram-bridge: shutdown after ${signal} failed:`, err.message);
+            process.exit(1);
+        });
+    });
+}
+
+process.on("uncaughtException", (err) => {
+    console.error("telegram-bridge: uncaught exception:", err);
+    shutdown("uncaughtException", 1).catch(() => process.exit(1));
+});
+
+process.on("unhandledRejection", (err) => {
+    console.error("telegram-bridge: unhandled rejection:", err);
+    shutdown("unhandledRejection", 1).catch(() => process.exit(1));
+});
+
+process.on("beforeExit", () => {
+    if (currentBotName && currentSessionId) removeLock(currentBotName, currentSessionId);
+    cleanupTmpDir();
 });
 
 main().catch(err => {

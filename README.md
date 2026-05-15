@@ -82,6 +82,7 @@ Access control is shared -- pairing with any bot grants access to all bots manag
 - **Bot not responding** -- check that the token is valid. Try `/telegram disconnect` then `/telegram connect` again
 - **Pairing code expired** -- codes expire after 5 minutes. Send a new message to the bot to get a fresh one
 - **"Another session has this bot"** -- the bot is locked by another CLI session. Connecting again takes it over
+- **Bot shows locked by an old session** -- recent versions refresh `lock.json` while polling and treat locks as stale when the heartbeat expires, the PID exits, or Linux detects PID reuse. On non-Linux platforms, stale detection still uses the heartbeat and PID liveness checks. Reconnect with `/telegram connect <name>` to replace the stale lock safely.
 
 ## Security
 
