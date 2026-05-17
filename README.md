@@ -63,16 +63,24 @@ A GitHub Copilot CLI extension that bridges Telegram messages bidirectionally wi
 |---|---|
 | `/telegram setup <name>` | Register a new bot with a local alias |
 | `/telegram connect <name>` | Connect this session to the named bot |
+| `/telegram connect <name> --takeover` | Explicitly replace another live session holding the bot |
 | `/telegram connect` | List all registered bots with their status |
 | `/telegram disconnect` | Disconnect from the current bot |
 | `/telegram status` | Show all bots, availability, and paired users |
 | `/telegram remove <name>` | Remove a bot from the registry |
 
+
+## Runtime behavior
+
+### Live response streaming
+
+While Copilot is generating a response, the bridge streams `assistant.message_delta` events to Telegram by creating a draft message and editing it at a throttled pace. This avoids a long-lived `typing...` indicator with no visible progress. When Copilot emits the final `assistant.message`, the bridge replaces the draft with the final first chunk and sends any remaining chunks as follow-up messages.
+
 ## Multiple Bots
 
 You can register as many bots as you want with `/telegram setup`. Each Copilot CLI session connects to one bot at a time, but multiple sessions can run different bots simultaneously.
 
-If a new session connects to a bot that another session already holds, the new session takes over and the old one releases gracefully.
+If a new session connects to a bot that another session already holds, the bridge refuses by default. Use `/telegram connect <name> --takeover` when you intentionally want the new session to replace the old one.
 
 Access control is shared -- pairing with any bot grants access to all bots managed by this extension.
 
@@ -80,8 +88,16 @@ Access control is shared -- pairing with any bot grants access to all bots manag
 
 - **Extension not loading** -- make sure you enabled the EXTENSIONS feature flag (`/experimental` in the CLI). Then verify the file exists at `~/.copilot/extensions/copilot-cli-telegram-bridge/extension.mjs`
 - **Bot not responding** -- check that the token is valid. Try `/telegram disconnect` then `/telegram connect` again
+- **The response appears stuck on typing** -- recent bridge versions stream assistant deltas into an edited draft message. If you still only see typing, Copilot may be blocked on a CLI permission prompt rather than generating text. Check the Copilot terminal for an approval picker.
+- **Startup fails with `Extension "unknown" was denied permission access`** -- newer Copilot CLI builds may require explicit permission for extensions that participate in permission handling. Start Copilot CLI with `--allow-tool extension-permission-access` and then reconnect with `/telegram connect <name>`.
 - **Pairing code expired** -- codes expire after 5 minutes. Send a new message to the bot to get a fresh one
-- **"Another session has this bot"** -- the bot is locked by another CLI session. Connecting again takes it over
+- **"Another session has this bot"** -- the bot is locked by another CLI session. Reconnect with `/telegram connect <name> --takeover` only if you intentionally want to replace that active session.
+- **Bot shows locked by an old session** -- recent versions refresh `lock.json` while polling and treat locks as stale when the heartbeat expires, the PID exits, or Linux detects PID reuse. On non-Linux platforms, stale detection still uses the heartbeat and PID liveness checks. Reconnect with `/telegram connect <name>` to replace the stale lock safely.
+
+
+### Stale lock recovery
+
+The bridge lock file includes a heartbeat and process identity. A lock is treated as stale when the owner process exits, the heartbeat expires, or, on Linux, the stored process start token no longer matches the current process. This prevents dead sessions and PID reuse from leaving a bot permanently locked.
 
 ## Security
 
@@ -90,6 +106,7 @@ Bot tokens are stored **in plain text** in `bots.json` (with restricted file per
 - Do not commit `bots.json` to version control
 - Do not share or back up the extension directory without removing `bots.json` first
 - If a token is compromised, revoke it immediately via @BotFather (`/revoke`) and register a new one with `/telegram setup`
+- If you start Copilot CLI with broad permissions such as `--allow-all-tools`, pairing a Telegram user gives that user remote access to the same Copilot session and tool approvals available in the local CLI. Only pair trusted users and use the narrowest Copilot permissions that fit your workflow.
 
 ## Uninstall
 
