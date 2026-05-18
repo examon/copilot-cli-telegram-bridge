@@ -6,8 +6,8 @@ const src = readFileSync(new URL('../extension.mjs', import.meta.url), 'utf8');
 
 test('bridge defines health.json path and stale watchdog constants', () => {
   assert.match(src, /function botHealthPath\(name\)/);
-  assert.match(src, /PROMPT_STALE_AFTER_MS\s*=\s*8 \* 60 \* 1000/);
-  assert.match(src, /MAX_TYPING_SESSION_MS\s*=\s*10 \* 60 \* 1000/);
+  assert.match(src, /PROMPT_STALE_AFTER_MS\s*=\s*15 \* 60 \* 1000/);
+  assert.match(src, /MAX_TYPING_SESSION_MS\s*=\s*30 \* 60 \* 1000/);
 });
 
 test('inbound prompts start and clear an active prompt lifecycle', () => {
