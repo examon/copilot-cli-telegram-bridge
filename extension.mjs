@@ -3,9 +3,10 @@
 // ============================================================
 
 import { joinSession } from "@github/copilot-sdk/extension";
-import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, renameSync, mkdtempSync } from "node:fs";
 import { join, basename } from "node:path";
 import { randomBytes } from "node:crypto";
+import { hostname, platform, tmpdir } from "node:os";
 
 // ============================================================
 // Section 1: Constants & Configuration
@@ -15,7 +16,7 @@ const EXT_DIR = import.meta.dirname;
 const ACCESS_PATH = join(EXT_DIR, "access.json");
 const BOTS_REGISTRY_PATH = join(EXT_DIR, "bots.json");
 const BOTS_DIR = join(EXT_DIR, "bots");
-const TMP_DIR = join("/tmp", `telegram-bridge-${process.pid}`);
+const TMP_DIR_PREFIX = join(tmpdir(), "telegram-bridge-");
 
 const TELEGRAM_API = "https://api.telegram.org";
 const POLL_TIMEOUT = 30;
@@ -28,6 +29,18 @@ const PAIRING_EXPIRY_MS = 300000;
 const ERROR_RETRY_BASE_MS = 5000;
 const ERROR_RETRY_MAX_MS = 60000;
 const API_TIMEOUT_MS = 30000;
+const STREAM_EDIT_INTERVAL_MS = 1500;
+const STREAM_MIN_DELTA_CHARS = 24;
+const STREAM_DRAFT_MAX = 3800;
+const LOCK_STALE_AFTER_MS = (POLL_TIMEOUT + ERROR_RETRY_MAX_MS / 1000 + 45) * 1000;
+const PROMPT_STALE_AFTER_MS = 15 * 60 * 1000;
+const MAX_TYPING_SESSION_MS = 30 * 60 * 1000;
+const PROMPT_WATCHDOG_INTERVAL_MS = 30000;
+const HEALTH_WRITE_MIN_INTERVAL_MS = 5000;
+const PROGRESS_NOTICE_AFTER_MS = 10 * 60 * 1000;
+const PROGRESS_NOTICE_INTERVAL_MS = 10 * 60 * 1000;
+const PROGRESS_NOTICE_ITERATION_MS = 60 * 1000;
+const PROGRESS_NOTICE_MAX_ITERATIONS = 90;
 
 
 // ============================================================
@@ -57,6 +70,7 @@ function saveJsonAtomic(filePath, data, mode) {
 function botDir(name) { return join(BOTS_DIR, name); }
 function botStatePath(name) { return join(botDir(name), "state.json"); }
 function botLockPath(name) { return join(botDir(name), "lock.json"); }
+function botHealthPath(name) { return join(botDir(name), "health.json"); }
 
 function chunkMessage(text, maxLen = CHUNK_MAX) {
     const chunks = [];
@@ -156,6 +170,10 @@ function markdownToTelegramHtml(md) {
 
 function generatePairingCode() {
     return randomBytes(4).toString("hex").slice(0, 6);
+}
+
+function messageSafeRandom() {
+    return randomBytes(8).toString("hex");
 }
 
 function sleep(ms) {
@@ -276,6 +294,18 @@ function editMessageText(chatId, messageId, text, parseMode) {
     return callTelegram("editMessageText", params);
 }
 
+async function editFormattedMessage(chatId, messageId, markdown) {
+    const html = markdownToTelegramHtml(markdown);
+    try {
+        return await editMessageText(chatId, messageId, html, "HTML");
+    } catch (err) {
+        if (err.message && /can.t parse|entit/i.test(err.message)) {
+            return editMessageText(chatId, messageId, markdown);
+        }
+        throw err;
+    }
+}
+
 function deleteMessage(chatId, messageId) {
     return callTelegram("deleteMessage", { chat_id: chatId, message_id: messageId });
 }
@@ -298,9 +328,9 @@ async function downloadFile(filePath) {
     if (!res.ok) throw new Error(`Download failed: ${res.status}`);
     const buffer = Buffer.from(await res.arrayBuffer());
     ensureTmpDir();
-    const localName = basename(filePath);
-    const localPath = join(TMP_DIR, localName);
-    writeFileSync(localPath, buffer);
+    const localName = `${messageSafeRandom()}-${basename(filePath)}`;
+    const localPath = join(tmpDir, localName);
+    writeFileSync(localPath, buffer, { mode: 0o600, flag: "wx" });
     return localPath;
 }
 
@@ -315,6 +345,12 @@ function enqueue(fn) {
     return new Promise((resolve, reject) => {
         sendQueue.push({ fn, resolve, reject });
         if (!sendQueueRunning) drainQueue();
+    });
+}
+
+function enqueueBestEffort(fn, context = "telegram-send") {
+    enqueue(fn).catch(err => {
+        console.error(`telegram-bridge: ${context} failed:`, err.message);
     });
 }
 
@@ -354,6 +390,18 @@ let connected = false;
 let botInfo = null;
 let currentSessionId = null;
 let currentBotName = null;
+let tmpDir = null;
+
+let activePrompt = null;
+let promptWatchdogTimer = null;
+let lastPollAt = null;
+let lastUpdateAt = null;
+let lastInboundPromptAt = null;
+let lastCopilotEventAt = null;
+let lastToolEventAt = null;
+let typingStartedAt = null;
+let typingCapWarningSent = false;
+let lastHealthWriteAt = 0;
 
 // ============================================================
 // Section 5b: Lock File Management
@@ -365,29 +413,308 @@ function readLock(name) {
     return data;
 }
 
-function writeLock(name, sessionId) {
-    saveJsonAtomic(botLockPath(name), {
+function getProcessStartToken(pid) {
+    if (platform() !== "linux") return null;
+
+    try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+        const lastParen = stat.lastIndexOf(")");
+        if (lastParen === -1) return null;
+        const fields = stat.slice(lastParen + 2).trim().split(/\s+/);
+        const startTime = fields[19]; // Linux procfs starttime field.
+        return startTime ? `linux:${startTime}` : null;
+    } catch {
+        return null;
+    }
+}
+
+function createLockData(name, sessionId, connectedAt = new Date().toISOString()) {
+    return {
         pid: process.pid,
         sessionId,
-        connectedAt: new Date().toISOString(),
-    });
+        botName: name,
+        hostname: hostname(),
+        processStartToken: getProcessStartToken(process.pid),
+        processStartTokenSource: platform(),
+        connectedAt,
+        updatedAt: new Date().toISOString(),
+    };
+}
+
+function writeLock(name, sessionId) {
+    saveJsonAtomic(botLockPath(name), createLockData(name, sessionId));
+}
+
+function lockOwnedByCurrentProcess(lock, sessionId) {
+    if (!lock || lock.pid !== process.pid || lock.sessionId !== sessionId) return false;
+    if (lock.hostname && lock.hostname !== hostname()) return false;
+    if (lock.processStartToken) {
+        const currentStartToken = getProcessStartToken(lock.pid);
+        if (currentStartToken && currentStartToken !== lock.processStartToken) return false;
+    }
+    return true;
+}
+
+function refreshLock(name, sessionId) {
+    const lock = readLock(name);
+    if (!lockOwnedByCurrentProcess(lock, sessionId)) return false;
+    const connectedAt = lock.connectedAt || new Date().toISOString();
+    saveJsonAtomic(botLockPath(name), createLockData(name, sessionId, connectedAt));
+    return true;
 }
 
 function removeLock(name, sessionId) {
     const lock = readLock(name);
-    if (lock && lock.sessionId === sessionId) {
+    if (lockOwnedByCurrentProcess(lock, sessionId)) {
         try { rmSync(botLockPath(name), { force: true }); } catch {}
     }
 }
 
 function isLockStale(lock) {
     if (!lock) return true;
+
+    const updatedAt = Date.parse(lock.updatedAt || lock.connectedAt || "");
+    if (!Number.isFinite(updatedAt)) return true;
+    const heartbeatExpired = Date.now() - updatedAt > LOCK_STALE_AFTER_MS;
+
+    // PID and start-token checks are only meaningful on the host that wrote the lock.
+    if (lock.hostname && lock.hostname !== hostname()) return heartbeatExpired;
+
     try {
         process.kill(lock.pid, 0);
-        return false;
     } catch {
         return true;
     }
+
+    if (lock.processStartToken) {
+        const currentStartToken = getProcessStartToken(lock.pid);
+        if (currentStartToken && currentStartToken !== lock.processStartToken) return true;
+    }
+
+    return heartbeatExpired;
+}
+
+// ============================================================
+// Section 5c: Bridge Health and Prompt Watchdog
+// ============================================================
+
+function nowIso() {
+    return new Date().toISOString();
+}
+
+function parseTimeMs(value) {
+    const ts = Date.parse(value || "");
+    return Number.isFinite(ts) ? ts : null;
+}
+
+function ageMs(value) {
+    const ts = parseTimeMs(value);
+    return ts == null ? null : Math.max(0, Date.now() - ts);
+}
+
+function formatAge(value) {
+    const ms = typeof value === "number" ? value : ageMs(value);
+    if (ms == null) return "never";
+    const seconds = Math.round(ms / 1000);
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.round(minutes / 60);
+    return `${hours}h ago`;
+}
+
+function getLikelyState(snapshot) {
+    if (!snapshot.connected) return "disconnected";
+    if (snapshot.activePrompt?.stale) return "Copilot session stalled";
+    if (snapshot.activePrompt) return "waiting for Copilot response";
+    return "healthy/idle";
+}
+
+function buildHealthSnapshot(reason = "snapshot") {
+    const activePromptAge = activePrompt ? ageMs(activePrompt.startedAt) : null;
+    const activePromptActivityAge = activePrompt ? ageMs(activePrompt.lastActivityAt || activePrompt.startedAt) : null;
+    const typingAge = typingStartedAt ? Date.now() - typingStartedAt : null;
+    const snapshot = {
+        reason,
+        updatedAt: nowIso(),
+        connected,
+        pid: process.pid,
+        sessionId: currentSessionId,
+        botName: currentBotName,
+        botUsername: botInfo?.username || null,
+        hostname: hostname(),
+        lastPollAt,
+        lastUpdateAt,
+        lastInboundPromptAt,
+        lastCopilotEventAt,
+        lastToolEventAt,
+        typingActive: Boolean(typingInterval),
+        typingAgeMs: typingAge,
+        activePrompt: activePrompt ? {
+            id: activePrompt.id,
+            chatId: activePrompt.chatId,
+            messageId: activePrompt.messageId,
+            startedAt: activePrompt.startedAt,
+            lastActivityAt: activePrompt.lastActivityAt,
+            warningSent: Boolean(activePrompt.warningSent),
+            progressNoticeCount: activePrompt.progressNoticeCount || 0,
+            lastProgressNoticeAt: activePrompt.lastProgressNoticeAt || null,
+            ageMs: activePromptAge,
+            activityAgeMs: activePromptActivityAge,
+            stale: activePromptActivityAge != null && activePromptActivityAge > PROMPT_STALE_AFTER_MS,
+        } : null,
+    };
+    snapshot.likelyState = getLikelyState(snapshot);
+    return snapshot;
+}
+
+function writeHealthSnapshot(reason = "snapshot", { force = true } = {}) {
+    if (!currentBotName) return;
+    const now = Date.now();
+    if (!force && now - lastHealthWriteAt < HEALTH_WRITE_MIN_INTERVAL_MS) return;
+    try {
+        mkdirSync(botDir(currentBotName), { recursive: true });
+        saveJsonAtomic(botHealthPath(currentBotName), buildHealthSnapshot(reason));
+        lastHealthWriteAt = now;
+    } catch (err) {
+        console.error("telegram-bridge: failed to write health snapshot:", err.message);
+    }
+}
+
+function recordCopilotEvent(kind) {
+    lastCopilotEventAt = nowIso();
+    if (kind?.startsWith("tool.")) lastToolEventAt = lastCopilotEventAt;
+    if (activePrompt) activePrompt.lastActivityAt = lastCopilotEventAt;
+    writeHealthSnapshot(kind || "copilot-event", { force: !kind?.endsWith("_delta") });
+}
+
+function isChildAssistantEvent(event) {
+    return Boolean(event?.agentId || event?.data?.agentId || event?.data?.parentToolCallId);
+}
+
+function ensurePromptWatchdog() {
+    if (promptWatchdogTimer) return;
+    promptWatchdogTimer = setInterval(() => {
+        checkPromptWatchdog().catch(err => {
+            console.error("telegram-bridge: prompt watchdog failed:", err.message);
+        });
+    }, PROMPT_WATCHDOG_INTERVAL_MS);
+}
+
+function stopPromptWatchdogIfIdle() {
+    if (!promptWatchdogTimer || activePrompt) return;
+    clearInterval(promptWatchdogTimer);
+    promptWatchdogTimer = null;
+}
+
+function startActivePrompt(chatId, messageId) {
+    const startedAt = nowIso();
+    activePrompt = {
+        id: messageSafeRandom(),
+        chatId,
+        messageId,
+        startedAt,
+        lastActivityAt: startedAt,
+        warningSent: false,
+        progressNoticeCount: 0,
+        lastProgressNoticeAt: null,
+    };
+    lastInboundPromptAt = startedAt;
+    typingCapWarningSent = false;
+    ensurePromptWatchdog();
+    writeHealthSnapshot("prompt-started");
+}
+
+function clearActivePrompt(reason = "completed") {
+    activePrompt = null;
+    typingCapWarningSent = false;
+    stopPromptWatchdogIfIdle();
+    writeHealthSnapshot(`prompt-${reason}`);
+}
+
+function progressDetail(promptAge, promptActivityAge) {
+    if (streamDrafts.size > 0) return `streaming response (${formatAge(promptActivityAge).replace(" ago", "")} since last delta)`;
+    if (activeTools.size > 0) {
+        const toolText = composeBubbleText();
+        return toolText ? `tool active: ${toolText.replace(/^●\s*/, "")}` : "tool active";
+    }
+    return `waiting for non-streaming response (${formatAge(promptActivityAge).replace(" ago", "")} elapsed)`;
+}
+
+async function maybeSendProgressNotice(promptAge, promptActivityAge) {
+    if (!activePrompt || promptAge == null || promptAge < PROGRESS_NOTICE_AFTER_MS) return;
+    const lastNoticeAge = activePrompt.lastProgressNoticeAt ? ageMs(activePrompt.lastProgressNoticeAt) : null;
+    if (lastNoticeAge != null && lastNoticeAge < PROGRESS_NOTICE_INTERVAL_MS) return;
+
+    activePrompt.progressNoticeCount = (activePrompt.progressNoticeCount || 0) + 1;
+    activePrompt.lastProgressNoticeAt = nowIso();
+    const iteration = Math.max(1, Math.ceil(promptAge / PROGRESS_NOTICE_ITERATION_MS));
+    const maxIteration = Math.max(iteration, PROGRESS_NOTICE_MAX_ITERATIONS);
+    const chatId = activePrompt.chatId;
+    const detail = progressDetail(promptAge, promptActivityAge);
+    await enqueue(() => sendMessage(
+        chatId,
+        `⏳ Still working... (${formatAge(promptAge).replace(" ago", "")} elapsed — iteration ${iteration}/${maxIteration}, ${detail})`
+    ).catch(() => {}));
+    writeHealthSnapshot("progress-notice");
+}
+
+async function checkPromptWatchdog() {
+    if (!connected || !activePrompt) {
+        stopPromptWatchdogIfIdle();
+        return;
+    }
+
+    const promptAge = ageMs(activePrompt.startedAt);
+    const promptActivityAge = ageMs(activePrompt.lastActivityAt || activePrompt.startedAt);
+    const typingAge = typingStartedAt ? Date.now() - typingStartedAt : null;
+
+    await maybeSendProgressNotice(promptAge, promptActivityAge);
+
+    if (typingAge != null && typingAge > MAX_TYPING_SESSION_MS && typingInterval) {
+        stopTyping();
+        if (!typingCapWarningSent) {
+            typingCapWarningSent = true;
+            const typingCapChatId = activePrompt.chatId;
+            await enqueue(() => sendMessage(
+                typingCapChatId,
+                `Copilot has been working for ${formatAge(typingAge).replace(" ago", "")}. Stopped the Telegram typing indicator so it does not run forever. The session may still finish.`
+            ).catch(() => {}));
+        }
+    }
+
+    if (promptActivityAge != null && promptActivityAge > PROMPT_STALE_AFTER_MS && !activePrompt.warningSent) {
+        activePrompt.warningSent = true;
+        stopTyping();
+        resetStreamDraftState();
+        bubbleActive = false;
+        const stalledChatId = activePrompt.chatId;
+        await dismissBubble().catch(() => {});
+        await enqueue(() => sendMessage(
+            stalledChatId,
+            `Copilot appears stuck. The bridge is still connected, but the session has not produced assistant, tool, or idle events for ${formatAge(promptActivityAge).replace(" ago", "")}. Restart may be needed.`
+        ).catch(() => {}));
+        writeHealthSnapshot("prompt-stalled");
+    } else {
+        writeHealthSnapshot("watchdog");
+    }
+}
+
+function healthStatusLines() {
+    const h = buildHealthSnapshot("status");
+    const lines = [
+        "",
+        "Health:",
+        `  Polling: ${h.lastPollAt ? `last poll ${formatAge(h.lastPollAt)}` : "not yet observed"}`,
+        `  Last Telegram update: ${h.lastUpdateAt ? formatAge(h.lastUpdateAt) : "never"}`,
+        `  Last inbound prompt: ${h.lastInboundPromptAt ? formatAge(h.lastInboundPromptAt) : "never"}`,
+        `  Last Copilot event: ${h.lastCopilotEventAt ? formatAge(h.lastCopilotEventAt) : "never"}`,
+        `  Last tool event: ${h.lastToolEventAt ? formatAge(h.lastToolEventAt) : "never"}`,
+        `  Typing active: ${h.typingActive ? `yes (${formatAge(h.typingAgeMs).replace(" ago", "")})` : "no"}`,
+        `  Active prompt: ${h.activePrompt ? `yes (${formatAge(h.activePrompt.ageMs).replace(" ago", "")})` : "no"}`,
+        `  Likely state: ${h.likelyState}`,
+    ];
+    return lines;
 }
 
 // ============================================================
@@ -453,6 +780,7 @@ let typingDebounceTimer = null;
 
 function startTyping(chatIds) {
     stopTyping();
+    typingStartedAt = Date.now();
     const doType = () => {
         for (const chatId of chatIds) {
             enqueue(() => sendChatAction(chatId).catch(() => {}));
@@ -472,6 +800,126 @@ function resetTypingDebounce() {
 function stopTyping() {
     if (typingInterval) { clearInterval(typingInterval); typingInterval = null; }
     if (typingDebounceTimer) { clearTimeout(typingDebounceTimer); typingDebounceTimer = null; }
+    typingStartedAt = null;
+}
+
+// ============================================================
+// Section 7b: Assistant Delta Streaming Draft
+// ============================================================
+
+const streamDrafts = new Map(); // chatId -> { messageId, text, lastSentText, lastEditAt, timer, flushing }
+let currentAssistantText = "";
+
+function resetStreamDraftState() {
+    currentAssistantText = "";
+    for (const draft of streamDrafts.values()) {
+        if (draft.timer) clearTimeout(draft.timer);
+    }
+    streamDrafts.clear();
+}
+
+function trimDraftText(text) {
+    if (text.length <= STREAM_DRAFT_MAX) return text;
+    const tail = text.slice(-STREAM_DRAFT_MAX + 80).replace(/^\S*\s*/, "");
+    return `…\n${tail}`;
+}
+
+function draftNeedsFlush(draft, text, force = false) {
+    if (!text || text === draft.lastSentText) return false;
+    if (force) return true;
+    if (!draft.lastSentText) return true;
+    return Math.abs(text.length - draft.lastSentText.length) >= STREAM_MIN_DELTA_CHARS;
+}
+
+function scheduleStreamDraftFlush(chatIds, force = false) {
+    const text = trimDraftText(currentAssistantText);
+    if (!text) return;
+
+    for (const chatId of chatIds) {
+        let draft = streamDrafts.get(chatId);
+        if (!draft) {
+            draft = { messageId: null, text: "", lastSentText: "", lastEditAt: 0, timer: null, flushing: false };
+            streamDrafts.set(chatId, draft);
+        }
+        draft.text = text;
+
+        if (!draftNeedsFlush(draft, text, force)) continue;
+        if (draft.timer) continue;
+
+        const elapsed = Date.now() - draft.lastEditAt;
+        const delay = force ? 0 : Math.max(0, STREAM_EDIT_INTERVAL_MS - elapsed);
+        draft.timer = setTimeout(() => flushStreamDraft(chatId, force), delay);
+    }
+}
+
+async function flushStreamDraft(chatId, force = false) {
+    const draft = streamDrafts.get(chatId);
+    if (!draft) return;
+    draft.timer = null;
+    if (draft.flushing) {
+        if (force) {
+            while (draft.flushing) await sleep(10);
+            return flushStreamDraft(chatId, true);
+        }
+        draft.timer = setTimeout(() => flushStreamDraft(chatId, false), STREAM_EDIT_INTERVAL_MS);
+        return;
+    }
+    if (!draftNeedsFlush(draft, draft.text, force)) return;
+
+    draft.flushing = true;
+    try {
+        const text = draft.text;
+        if (draft.messageId) {
+            try {
+                await enqueue(() => editFormattedMessage(chatId, draft.messageId, text));
+            } catch (err) {
+                if (/message is not modified/i.test(err?.message)) {
+                    // Fine, our last sent text already matches Telegram's copy.
+                } else if (/message to edit not found/i.test(err?.message)) {
+                    const sent = await enqueue(() => sendFormattedMessage(chatId, text));
+                    draft.messageId = sent.message_id;
+                } else {
+                    throw err;
+                }
+            }
+        } else {
+            const sent = await enqueue(() => sendFormattedMessage(chatId, text));
+            draft.messageId = sent.message_id;
+        }
+        draft.lastSentText = text;
+        draft.lastEditAt = Date.now();
+    } finally {
+        draft.flushing = false;
+        if (draft.text !== draft.lastSentText && streamDrafts.get(chatId) === draft) {
+            draft.timer = setTimeout(() => flushStreamDraft(chatId, false), STREAM_EDIT_INTERVAL_MS);
+        }
+    }
+}
+
+async function finalizeStreamDrafts(finalContent) {
+    const chatIds = getAllowedChatIds();
+    const finalFirstChunk = chunkMessage(finalContent)[0] || finalContent;
+    const finalizedChatIds = new Set();
+    currentAssistantText = finalFirstChunk;
+    scheduleStreamDraftFlush(chatIds, true);
+
+    const pending = [];
+    for (const chatId of chatIds) {
+        const draft = streamDrafts.get(chatId);
+        if (!draft) continue;
+        if (draft.timer) {
+            clearTimeout(draft.timer);
+            draft.timer = null;
+        }
+        pending.push(
+            flushStreamDraft(chatId, true)
+                .then(() => finalizedChatIds.add(chatId))
+                .catch(() => {})
+        );
+    }
+    await Promise.all(pending);
+    resetStreamDraftState();
+    return finalizedChatIds;
 }
 
 // ============================================================
@@ -664,11 +1112,15 @@ async function deleteAllBubbleMessages() {
 // ============================================================
 
 function ensureTmpDir() {
-    if (!existsSync(TMP_DIR)) mkdirSync(TMP_DIR, { recursive: true });
+    if (!tmpDir || !existsSync(tmpDir)) {
+        tmpDir = mkdtempSync(TMP_DIR_PREFIX);
+    }
 }
 
 function cleanupTmpDir() {
-    try { rmSync(TMP_DIR, { recursive: true, force: true }); } catch {}
+    if (!tmpDir) return;
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    tmpDir = null;
 }
 
 async function handleFileAttachment(message) {
@@ -723,11 +1175,22 @@ async function processUpdate(update) {
         return;
     }
 
+    const allChatIds = getAllowedChatIds();
+    if (activePrompt) {
+        await enqueue(() => sendMessage(
+            chatId,
+            "Copilot is still working on the previous Telegram prompt. Wait for it to finish before sending another."
+        ).catch(() => {}));
+        return;
+    }
+
+    startActivePrompt(chatId, message.message_id);
+    resetStreamDraftState();
+
     // Ack reaction
-    enqueue(() => setMessageReaction(chatId, message.message_id, "\uD83D\uDC40").catch(() => {}));
+    enqueueBestEffort(() => setMessageReaction(chatId, message.message_id, "\uD83D\uDC40"), "message-reaction");
 
     // Start typing for all allowed chats
-    const allChatIds = getAllowedChatIds();
     startTyping(allChatIds);
     bubbleActive = true;
     scheduleBubbleUpdate();
@@ -741,9 +1204,15 @@ async function processUpdate(update) {
                     prompt: text || "User sent a file.",
                     attachments: [{ type: "file", path: attachment.path, displayName: attachment.displayName }],
                 });
+                writeHealthSnapshot("prompt-sent");
                 return;
             }
         } catch (err) {
+            clearActivePrompt("attachment-error");
+            stopTyping();
+            resetStreamDraftState();
+            bubbleActive = false;
+            await dismissBubble().catch(() => {});
             await enqueue(() => sendMessage(chatId, `Failed to process attachment: ${err.message}`));
             return;
         }
@@ -751,9 +1220,15 @@ async function processUpdate(update) {
 
     if (text) {
         await session.send({ prompt: text });
+        writeHealthSnapshot("prompt-sent");
         return;
     }
 
+    clearActivePrompt("unsupported-message");
+    stopTyping();
+    resetStreamDraftState();
+    bubbleActive = false;
+    await dismissBubble().catch(() => {});
     await enqueue(() => sendMessage(chatId, "Unsupported message type. Text, photos, and documents only."));
 }
 
@@ -767,42 +1242,70 @@ function setupEventHandlers(sess) {
     if (eventHandlersRegistered) return;
     eventHandlersRegistered = true;
 
-    sess.on("assistant.message", (event) => {
+    sess.on("assistant.message", async (event) => {
         if (!connected) return;
-        if (event.data.parentToolCallId) return;
+        recordCopilotEvent("assistant.message");
+        if (isChildAssistantEvent(event)) return;
 
         const content = event.data.content;
         if (!content || content.trim().length === 0) return;
 
+        clearActivePrompt("assistant-message");
+        stopTyping();
         resetTypingDebounce();
 
         const chatIds = getAllowedChatIds();
         const chunks = chunkMessage(content);
+
+        if (streamDrafts.size > 0) {
+            const finalizedChatIds = await finalizeStreamDrafts(chunks[0] || content).catch(() => new Set());
+            for (const chatId of chatIds) {
+                if (!finalizedChatIds.has(chatId) && chunks[0]) {
+                    enqueueBestEffort(() => sendFormattedMessage(chatId, chunks[0]), "assistant-first-chunk");
+                }
+                for (const chunk of chunks.slice(1)) {
+                    enqueueBestEffort(() => sendFormattedMessage(chatId, chunk), "assistant-followup-chunk");
+                }
+            }
+            return;
+        }
+
         for (const chatId of chatIds) {
             for (const chunk of chunks) {
-                enqueue(() => sendFormattedMessage(chatId, chunk));
+                enqueueBestEffort(() => sendFormattedMessage(chatId, chunk), "assistant-chunk");
             }
         }
     });
 
     sess.on("assistant.message_delta", (event) => {
         if (!connected) return;
-        if (event.data.parentToolCallId) return;
+        recordCopilotEvent("assistant.message_delta");
+        if (isChildAssistantEvent(event)) return;
         if (!event.data.deltaContent) return;
         resetTypingDebounce();
+        currentAssistantText += event.data.deltaContent;
+        scheduleStreamDraftFlush(getAllowedChatIds(), false);
     });
 
     sess.on("session.error", (event) => {
         if (!connected) return;
+        recordCopilotEvent("session.error");
+        clearActivePrompt("session-error");
+        stopTyping();
+        resetStreamDraftState();
+        bubbleActive = false;
         const errMsg = `Error: ${event.data.message || event.data.errorType || "Unknown error"}`;
         const chatIds = getAllowedChatIds();
         for (const chatId of chatIds) {
-            enqueue(() => sendMessage(chatId, errMsg));
+            enqueueBestEffort(() => sendMessage(chatId, errMsg), "session-error-message");
         }
     });
 
     sess.on("session.idle", () => {
+        recordCopilotEvent("session.idle");
+        clearActivePrompt("session-idle");
         stopTyping();
+        resetStreamDraftState();
         dismissBubble();
     });
 
@@ -812,6 +1315,7 @@ function setupEventHandlers(sess) {
 
     sess.on("tool.execution_start", (event) => {
         if (!connected) return;
+        recordCopilotEvent("tool.execution_start");
         resetTypingDebounce();
         bubbleActive = true;
         const toolCallId = event.data.toolCallId;
@@ -825,6 +1329,7 @@ function setupEventHandlers(sess) {
 
     sess.on("tool.execution_complete", (event) => {
         if (!connected) return;
+        recordCopilotEvent("tool.execution_complete");
         resetTypingDebounce();
         const toolCallId = event.data.toolCallId;
         const completed = activeTools.get(toolCallId);
@@ -843,16 +1348,16 @@ function setupEventHandlers(sess) {
                 const bytes = Math.ceil(block.data.length * 3 / 4);
                 if (bytes > MAX_PHOTO_BYTES) {
                     for (const chatId of chatIds) {
-                        enqueue(() => sendMessage(chatId, "(Image too large for Telegram, >10MB)"));
+                        enqueueBestEffort(() => sendMessage(chatId, "(Image too large for Telegram, >10MB)"), "large-image-warning");
                     }
                     continue;
                 }
                 for (const chatId of chatIds) {
                     if (PHOTO_MIMES.has(block.mimeType)) {
-                        enqueue(() => sendPhoto(chatId, block.data, block.mimeType));
+                        enqueueBestEffort(() => sendPhoto(chatId, block.data, block.mimeType), "tool-image-photo");
                     } else {
                         const ext = block.mimeType.split("/")[1] || "bin";
-                        enqueue(() => sendDocument(chatId, block.data, block.mimeType, `image.${ext}`));
+                        enqueueBestEffort(() => sendDocument(chatId, block.data, block.mimeType, `image.${ext}`), "tool-image-document");
                     }
                 }
             }
@@ -879,7 +1384,7 @@ function createUserInputHandler() {
             const chunks = chunkMessage(questionText);
             for (const chatId of chatIds) {
                 for (const chunk of chunks) {
-                    enqueue(() => sendFormattedMessage(chatId, chunk));
+                    enqueueBestEffort(() => sendFormattedMessage(chatId, chunk), "ask-user-question");
                 }
             }
 
@@ -951,7 +1456,7 @@ async function handleSetup(name) {
     );
 }
 
-async function handleConnect(name, sessionId) {
+async function handleConnect(name, sessionId, { takeover = false } = {}) {
     registry = loadJsonOrDefault(BOTS_REGISTRY_PATH, {});
 
     if (!name) {
@@ -967,10 +1472,18 @@ async function handleConnect(name, sessionId) {
         return;
     }
 
-    // Check lock -- if another live session holds it, take over (Telegram 409 will release them)
+    // Check lock before token validation, then re-check before claiming to avoid racing another session.
     const lock = readLock(name);
+    const staleLock = lock && isLockStale(lock) ? lock : null;
+    const takeoverRequested = takeover;
     let tookOverFrom = null;
-    if (lock && !isLockStale(lock) && lock.sessionId !== sessionId) {
+    if (lock && !staleLock && lock.sessionId !== sessionId) {
+        if (!takeoverRequested) {
+            await session.log(
+                `Bot '${name}' is already in use by session ${lock.sessionId}. Run \`/telegram connect ${name} --takeover\` to replace it.`
+            );
+            return;
+        }
         tookOverFrom = lock.sessionId;
     }
 
@@ -994,16 +1507,37 @@ async function handleConnect(name, sessionId) {
 
     // Claim lock and connect
     mkdirSync(botDir(name), { recursive: true });
+    const latestLock = readLock(name);
+    if (latestLock && !isLockStale(latestLock) && latestLock.sessionId !== sessionId) {
+        if (!takeoverRequested) {
+            botToken = null;
+            botInfo = null;
+            await session.log(
+                `Bot '${name}' was claimed by session ${latestLock.sessionId} while connecting. Run \`/telegram connect ${name} --takeover\` to replace it.`
+            );
+            return;
+        }
+        tookOverFrom = latestLock.sessionId;
+    }
+    if (staleLock?.sessionId) {
+        await session.log(`Replacing stale Telegram bridge lock from session ${staleLock.sessionId}.`);
+    }
     writeLock(name, sessionId);
     currentBotName = name;
     currentSessionId = sessionId;
     shutdownRequested = false;
+    lastPollAt = null;
+    lastUpdateAt = null;
+    lastInboundPromptAt = null;
+    lastCopilotEventAt = null;
+    lastToolEventAt = null;
 
     access = loadJsonOrDefault(ACCESS_PATH, { allowedUsers: [], pending: {} });
     state = loadJsonOrDefault(botStatePath(name), { offset: 0 });
     setupEventHandlers(session);
 
     connected = true;
+    writeHealthSnapshot("connected");
 
     const chatIds = getAllowedChatIds();
 
@@ -1022,7 +1556,7 @@ async function handleConnect(name, sessionId) {
         } else {
             await session.log(`Telegram bridge connected (@${botInfo.username}).`);
             for (const chatId of chatIds) {
-                enqueue(() => sendMessage(chatId, "Copilot CLI session connected."));
+                enqueueBestEffort(() => sendMessage(chatId, "Copilot CLI session connected."), "connect-notification");
             }
         }
     }
@@ -1032,43 +1566,45 @@ async function handleConnect(name, sessionId) {
     });
 }
 
+async function releaseBridge(reason = "disconnect", notify = true) {
+    shutdownRequested = true;
+    if (abortController) abortController.abort();
+
+    if (state && currentBotName) {
+        try { saveJsonAtomic(botStatePath(currentBotName), state); } catch {}
+    }
+
+    const chatIds = getAllowedChatIds();
+    resetStreamDraftState();
+    stopTyping();
+    activePrompt = null;
+    stopPromptWatchdogIfIdle();
+    if (notify && botToken) {
+        const goodbyePromises = chatIds.map(chatId =>
+            enqueue(() => sendMessage(chatId, "Copilot CLI session disconnected.").catch(() => {}))
+        );
+        await Promise.race([Promise.allSettled(goodbyePromises), sleep(3000)]);
+    }
+    if (botToken) await dismissBubble();
+
+    connected = false;
+    writeHealthSnapshot(`released-${reason}`);
+    if (currentBotName && currentSessionId) removeLock(currentBotName, currentSessionId);
+
+    botToken = null;
+    botInfo = null;
+    currentBotName = null;
+    currentSessionId = null;
+    state = null;
+}
+
 async function handleDisconnect(sessionId) {
     if (!connected) {
         await session.log("Not connected. Nothing to disconnect.");
         return;
     }
 
-    // 1. Stop poll loop
-    shutdownRequested = true;
-    if (abortController) abortController.abort();
-
-    // 2. Save state before anything else
-    if (state && currentBotName) {
-        try { saveJsonAtomic(botStatePath(currentBotName), state); } catch {}
-    }
-
-    // 3. Goodbye messages (needs botToken) -- collect promises so we can await drain
-    const chatIds = getAllowedChatIds();
-    const goodbyePromises = [];
-    for (const chatId of chatIds) {
-        goodbyePromises.push(enqueue(() => sendMessage(chatId, "Copilot CLI session disconnected.").catch(() => {})));
-    }
-    await Promise.race([Promise.allSettled(goodbyePromises), sleep(3000)]);
-
-    // 4. Stop typing and dismiss bubble (need botToken for API calls)
-    stopTyping();
-    await dismissBubble();
-
-    // 5. Mark disconnected and release lock
-    connected = false;
-    if (currentBotName) removeLock(currentBotName, sessionId);
-
-    // 6. Clear all bot-specific state
-    botToken = null;
-    botInfo = null;
-    currentBotName = null;
-    currentSessionId = null;
-    state = null;
+    await releaseBridge("disconnect", true);
 
     await session.log("Telegram bridge disconnected.");
 }
@@ -1105,6 +1641,8 @@ async function handleStatus(sessionId) {
 
     const pairedCount = access?.allowedUsers?.length || 0;
     lines.push(`\nPaired users: ${pairedCount}`);
+    lines.push(...healthStatusLines());
+    writeHealthSnapshot("status");
 
     await session.log(lines.join("\n"));
 }
@@ -1159,16 +1697,17 @@ async function handleRemove(name, sessionId) {
 
 // Route /telegram subcommands dispatched via SDK command protocol.
 async function handleTelegramCommand(args, sessionId) {
-    const parts = args.trim().split(/\s+/);
+    const parts = args.trim().split(/\s+/).filter(Boolean);
     const subcommand = parts[0]?.toLowerCase() || "help";
-    const botName = parts[1] || "";
+    const botName = parts.find(p => !p.startsWith("--") && p !== parts[0]) || "";
+    const takeover = parts.includes("--takeover");
 
     switch (subcommand) {
         case "setup":
             await handleSetup(botName);
             break;
         case "connect":
-            await handleConnect(botName, sessionId);
+            await handleConnect(botName, sessionId, { takeover });
             break;
         case "disconnect":
             await handleDisconnect(sessionId);
@@ -1180,37 +1719,25 @@ async function handleTelegramCommand(args, sessionId) {
             await handleRemove(botName, sessionId);
             break;
         default:
-            await session.log("Available: /telegram setup|connect|disconnect|status|remove");
+            await session.log("Available: /telegram setup|connect [--takeover]|disconnect|status|remove");
             break;
     }
 }
 
-// Register /telegram as an SDK slash command via the wire protocol.
-// The SDK's joinSession doesn't expose the `commands` parameter, so we
-// send a follow-up session.resume with just the commands field. The server
-// merges this additively -- undefined fields are skipped.
-async function registerSlashCommand(sess) {
-    const commands = [{ name: "telegram", description: "Telegram bridge: setup, connect, disconnect, status, remove" }];
-    // Must include hooks:true to preserve hook registrations from joinSession.
-    // Without it, the server treats this as enableHooksCallback:false and removes
-    // the ad-hoc hooks that were just registered.
-    await sess.connection.sendRequest("session.resume", {
-        sessionId: sess.sessionId,
-        commands,
-        hooks: true,
-    });
-
-    sess.on("command.execute", (event) => {
-        const { requestId, commandName, args } = event.data;
-        if (commandName !== "telegram") return;
-        handleTelegramCommand(args, sess.sessionId)
-            .then(() => sess.rpc.commands.handlePendingCommand({ requestId }))
-            .catch(err => {
-                console.error("telegram-bridge: command error:", err.message);
-                sess.rpc.commands.handlePendingCommand({ requestId, error: err.message });
-            });
-    });
+// Register /telegram as an SDK slash command. Current Copilot CLI SDKs expect
+// command definitions to include a handler; older bridge builds tried to send a
+// raw session.resume command without one, which now fails schema validation with
+// "Invalid command format" during extension startup.
+function createTelegramCommand() {
+    return {
+        name: "telegram",
+        description: "Telegram bridge: setup, connect, disconnect, status, remove",
+        handler: async ({ args = "", sessionId = session?.sessionId } = {}) => {
+            await handleTelegramCommand(args, sessionId);
+        },
+    };
 }
+
 
 // ============================================================
 // Section 12: Poll Loop
@@ -1223,7 +1750,15 @@ async function pollLoop() {
         abortController = new AbortController();
         try {
             const updates = await getUpdates(state.offset, POLL_TIMEOUT);
+            lastPollAt = nowIso();
             errorDelay = ERROR_RETRY_BASE_MS;
+            if (currentBotName && currentSessionId) {
+                refreshLock(currentBotName, currentSessionId);
+            }
+            if (updates.length > 0) {
+                lastUpdateAt = lastPollAt;
+            }
+            writeHealthSnapshot(updates.length > 0 ? "poll-updates" : "poll-empty");
 
             for (const update of updates) {
                 try {
@@ -1237,28 +1772,21 @@ async function pollLoop() {
             if (updates.length > 0 && currentBotName) {
                 saveJsonAtomic(botStatePath(currentBotName), state);
             }
+
+            if (currentBotName && currentSessionId && !refreshLock(currentBotName, currentSessionId)) {
+                await releaseBridge("lost-lock", false);
+                await session.log(
+                    "Telegram bridge released because another session replaced its lock.",
+                    { level: "warning" }
+                );
+                break;
+            }
         } catch (err) {
             if (abortController.signal.aborted) break;
 
             if (err.status === 409) {
-                // Save state before clearing
-                if (state && currentBotName) {
-                    try { saveJsonAtomic(botStatePath(currentBotName), state); } catch {}
-                }
-
-                // Stop typing and dismiss bubble (need botToken for API calls)
-                stopTyping();
-                try { await dismissBubble(); } catch {}
-
-                connected = false;
-                if (currentBotName && currentSessionId) removeLock(currentBotName, currentSessionId);
-
                 const lostBotName = currentBotName;
-                botToken = null;
-                botInfo = null;
-                currentBotName = null;
-                currentSessionId = null;
-                state = null;
+                await releaseBridge("takeover", false);
 
                 await session.log(
                     `Telegram bridge released (another session took over). Type /telegram connect ${lostBotName || "<name>"} to reclaim.`,
@@ -1267,6 +1795,7 @@ async function pollLoop() {
                 break;
             }
 
+            writeHealthSnapshot("poll-error");
             console.error(`telegram-bridge: poll error (retry in ${errorDelay}ms):`, err.message);
             await sleep(errorDelay);
             errorDelay = Math.min(errorDelay * 2, ERROR_RETRY_MAX_MS);
@@ -1284,6 +1813,8 @@ async function main() {
     cleanupTmpDir();
 
     session = await joinSession({
+        streaming: true,
+        commands: [createTelegramCommand()],
         onUserInputRequest: createUserInputHandler(),
         hooks: {
             onUserPromptSubmitted: (input) => {
@@ -1337,7 +1868,6 @@ async function main() {
         },
     });
 
-    await registerSlashCommand(session);
 
     const botCount = Object.keys(registry).length;
     if (botCount === 0) {
@@ -1347,16 +1877,17 @@ async function main() {
     }
 }
 
-// SIGTERM handler
-process.on("SIGTERM", async () => {
+async function shutdown(signalOrReason, exitCode = 0) {
     shutdownRequested = true;
     if (abortController) abortController.abort();
+    resetStreamDraftState();
 
     if (connected) {
         const lock = currentBotName ? readLock(currentBotName) : null;
-        const weOwnLock = lock && lock.pid === process.pid;
+        const weOwnLock = lockOwnedByCurrentProcess(lock, currentSessionId);
 
         if (weOwnLock) {
+            clearActivePrompt("shutdown");
             try {
                 const chatIds = getAllowedChatIds();
                 const promises = chatIds.map(chatId =>
@@ -1377,7 +1908,31 @@ process.on("SIGTERM", async () => {
 
     stopTyping();
     cleanupTmpDir();
-    process.exit(0);
+    process.exit(exitCode);
+}
+
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.on(signal, () => {
+        shutdown(signal).catch(err => {
+            console.error(`telegram-bridge: shutdown after ${signal} failed:`, err.message);
+            process.exit(1);
+        });
+    });
+}
+
+process.on("uncaughtException", (err) => {
+    console.error("telegram-bridge: uncaught exception:", err);
+    shutdown("uncaughtException", 1).catch(() => process.exit(1));
+});
+
+process.on("unhandledRejection", (err) => {
+    console.error("telegram-bridge: unhandled rejection:", err);
+    shutdown("unhandledRejection", 1).catch(() => process.exit(1));
+});
+
+process.on("beforeExit", () => {
+    if (currentBotName && currentSessionId) removeLock(currentBotName, currentSessionId);
+    cleanupTmpDir();
 });
 
 main().catch(err => {
