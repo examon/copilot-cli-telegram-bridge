@@ -32,10 +32,15 @@ const API_TIMEOUT_MS = 30000;
 const STREAM_EDIT_INTERVAL_MS = 1500;
 const STREAM_MIN_DELTA_CHARS = 24;
 const STREAM_DRAFT_MAX = 3800;
-const LOCK_STALE_AFTER_MS = (POLL_TIMEOUT + 45) * 1000;
+const LOCK_STALE_AFTER_MS = (POLL_TIMEOUT + ERROR_RETRY_MAX_MS / 1000 + 45) * 1000;
 const PROMPT_STALE_AFTER_MS = 15 * 60 * 1000;
 const MAX_TYPING_SESSION_MS = 30 * 60 * 1000;
 const PROMPT_WATCHDOG_INTERVAL_MS = 30000;
+const HEALTH_WRITE_MIN_INTERVAL_MS = 5000;
+const PROGRESS_NOTICE_AFTER_MS = 10 * 60 * 1000;
+const PROGRESS_NOTICE_INTERVAL_MS = 10 * 60 * 1000;
+const PROGRESS_NOTICE_ITERATION_MS = 60 * 1000;
+const PROGRESS_NOTICE_MAX_ITERATIONS = 90;
 
 
 // ============================================================
@@ -343,6 +348,12 @@ function enqueue(fn) {
     });
 }
 
+function enqueueBestEffort(fn, context = "telegram-send") {
+    enqueue(fn).catch(err => {
+        console.error(`telegram-bridge: ${context} failed:`, err.message);
+    });
+}
+
 async function drainQueue() {
     sendQueueRunning = true;
     while (sendQueue.length > 0) {
@@ -390,6 +401,7 @@ let lastCopilotEventAt = null;
 let lastToolEventAt = null;
 let typingStartedAt = null;
 let typingCapWarningSent = false;
+let lastHealthWriteAt = 0;
 
 // ============================================================
 // Section 5b: Lock File Management
@@ -545,6 +557,8 @@ function buildHealthSnapshot(reason = "snapshot") {
             startedAt: activePrompt.startedAt,
             lastActivityAt: activePrompt.lastActivityAt,
             warningSent: Boolean(activePrompt.warningSent),
+            progressNoticeCount: activePrompt.progressNoticeCount || 0,
+            lastProgressNoticeAt: activePrompt.lastProgressNoticeAt || null,
             ageMs: activePromptAge,
             activityAgeMs: activePromptActivityAge,
             stale: activePromptActivityAge != null && activePromptActivityAge > PROMPT_STALE_AFTER_MS,
@@ -554,11 +568,14 @@ function buildHealthSnapshot(reason = "snapshot") {
     return snapshot;
 }
 
-function writeHealthSnapshot(reason = "snapshot") {
+function writeHealthSnapshot(reason = "snapshot", { force = true } = {}) {
     if (!currentBotName) return;
+    const now = Date.now();
+    if (!force && now - lastHealthWriteAt < HEALTH_WRITE_MIN_INTERVAL_MS) return;
     try {
         mkdirSync(botDir(currentBotName), { recursive: true });
         saveJsonAtomic(botHealthPath(currentBotName), buildHealthSnapshot(reason));
+        lastHealthWriteAt = now;
     } catch (err) {
         console.error("telegram-bridge: failed to write health snapshot:", err.message);
     }
@@ -568,7 +585,11 @@ function recordCopilotEvent(kind) {
     lastCopilotEventAt = nowIso();
     if (kind?.startsWith("tool.")) lastToolEventAt = lastCopilotEventAt;
     if (activePrompt) activePrompt.lastActivityAt = lastCopilotEventAt;
-    writeHealthSnapshot(kind || "copilot-event");
+    writeHealthSnapshot(kind || "copilot-event", { force: !kind?.endsWith("_delta") });
+}
+
+function isChildAssistantEvent(event) {
+    return Boolean(event?.agentId || event?.data?.agentId || event?.data?.parentToolCallId);
 }
 
 function ensurePromptWatchdog() {
@@ -595,6 +616,8 @@ function startActivePrompt(chatId, messageId) {
         startedAt,
         lastActivityAt: startedAt,
         warningSent: false,
+        progressNoticeCount: 0,
+        lastProgressNoticeAt: null,
     };
     lastInboundPromptAt = startedAt;
     typingCapWarningSent = false;
@@ -609,21 +632,52 @@ function clearActivePrompt(reason = "completed") {
     writeHealthSnapshot(`prompt-${reason}`);
 }
 
+function progressDetail(promptAge, promptActivityAge) {
+    if (streamDrafts.size > 0) return `streaming response (${formatAge(promptActivityAge).replace(" ago", "")} since last delta)`;
+    if (activeTools.size > 0) {
+        const toolText = composeBubbleText();
+        return toolText ? `tool active: ${toolText.replace(/^●\s*/, "")}` : "tool active";
+    }
+    return `waiting for non-streaming response (${formatAge(promptActivityAge).replace(" ago", "")} elapsed)`;
+}
+
+async function maybeSendProgressNotice(promptAge, promptActivityAge) {
+    if (!activePrompt || promptAge == null || promptAge < PROGRESS_NOTICE_AFTER_MS) return;
+    const lastNoticeAge = activePrompt.lastProgressNoticeAt ? ageMs(activePrompt.lastProgressNoticeAt) : null;
+    if (lastNoticeAge != null && lastNoticeAge < PROGRESS_NOTICE_INTERVAL_MS) return;
+
+    activePrompt.progressNoticeCount = (activePrompt.progressNoticeCount || 0) + 1;
+    activePrompt.lastProgressNoticeAt = nowIso();
+    const iteration = Math.max(1, Math.ceil(promptAge / PROGRESS_NOTICE_ITERATION_MS));
+    const maxIteration = Math.max(iteration, PROGRESS_NOTICE_MAX_ITERATIONS);
+    const chatId = activePrompt.chatId;
+    const detail = progressDetail(promptAge, promptActivityAge);
+    await enqueue(() => sendMessage(
+        chatId,
+        `⏳ Still working... (${formatAge(promptAge).replace(" ago", "")} elapsed — iteration ${iteration}/${maxIteration}, ${detail})`
+    ).catch(() => {}));
+    writeHealthSnapshot("progress-notice");
+}
+
 async function checkPromptWatchdog() {
     if (!connected || !activePrompt) {
         stopPromptWatchdogIfIdle();
         return;
     }
 
+    const promptAge = ageMs(activePrompt.startedAt);
     const promptActivityAge = ageMs(activePrompt.lastActivityAt || activePrompt.startedAt);
     const typingAge = typingStartedAt ? Date.now() - typingStartedAt : null;
+
+    await maybeSendProgressNotice(promptAge, promptActivityAge);
 
     if (typingAge != null && typingAge > MAX_TYPING_SESSION_MS && typingInterval) {
         stopTyping();
         if (!typingCapWarningSent) {
             typingCapWarningSent = true;
+            const typingCapChatId = activePrompt.chatId;
             await enqueue(() => sendMessage(
-                activePrompt.chatId,
+                typingCapChatId,
                 `Copilot has been working for ${formatAge(typingAge).replace(" ago", "")}. Stopped the Telegram typing indicator so it does not run forever. The session may still finish.`
             ).catch(() => {}));
         }
@@ -1121,13 +1175,22 @@ async function processUpdate(update) {
         return;
     }
 
+    const allChatIds = getAllowedChatIds();
+    if (activePrompt) {
+        await enqueue(() => sendMessage(
+            chatId,
+            "Copilot is still working on the previous Telegram prompt. Wait for it to finish before sending another."
+        ).catch(() => {}));
+        return;
+    }
+
     startActivePrompt(chatId, message.message_id);
+    resetStreamDraftState();
 
     // Ack reaction
-    enqueue(() => setMessageReaction(chatId, message.message_id, "\uD83D\uDC40").catch(() => {}));
+    enqueueBestEffort(() => setMessageReaction(chatId, message.message_id, "\uD83D\uDC40"), "message-reaction");
 
     // Start typing for all allowed chats
-    const allChatIds = getAllowedChatIds();
     startTyping(allChatIds);
     bubbleActive = true;
     scheduleBubbleUpdate();
@@ -1182,12 +1245,12 @@ function setupEventHandlers(sess) {
     sess.on("assistant.message", async (event) => {
         if (!connected) return;
         recordCopilotEvent("assistant.message");
-        if (event.data.parentToolCallId) return;
-        clearActivePrompt("assistant-message");
+        if (isChildAssistantEvent(event)) return;
 
         const content = event.data.content;
         if (!content || content.trim().length === 0) return;
 
+        clearActivePrompt("assistant-message");
         stopTyping();
         resetTypingDebounce();
 
@@ -1198,10 +1261,10 @@ function setupEventHandlers(sess) {
             const finalizedChatIds = await finalizeStreamDrafts(chunks[0] || content).catch(() => new Set());
             for (const chatId of chatIds) {
                 if (!finalizedChatIds.has(chatId) && chunks[0]) {
-                    enqueue(() => sendFormattedMessage(chatId, chunks[0]));
+                    enqueueBestEffort(() => sendFormattedMessage(chatId, chunks[0]), "assistant-first-chunk");
                 }
                 for (const chunk of chunks.slice(1)) {
-                    enqueue(() => sendFormattedMessage(chatId, chunk));
+                    enqueueBestEffort(() => sendFormattedMessage(chatId, chunk), "assistant-followup-chunk");
                 }
             }
             return;
@@ -1209,7 +1272,7 @@ function setupEventHandlers(sess) {
 
         for (const chatId of chatIds) {
             for (const chunk of chunks) {
-                enqueue(() => sendFormattedMessage(chatId, chunk));
+                enqueueBestEffort(() => sendFormattedMessage(chatId, chunk), "assistant-chunk");
             }
         }
     });
@@ -1217,7 +1280,7 @@ function setupEventHandlers(sess) {
     sess.on("assistant.message_delta", (event) => {
         if (!connected) return;
         recordCopilotEvent("assistant.message_delta");
-        if (event.data.parentToolCallId) return;
+        if (isChildAssistantEvent(event)) return;
         if (!event.data.deltaContent) return;
         resetTypingDebounce();
         currentAssistantText += event.data.deltaContent;
@@ -1234,7 +1297,7 @@ function setupEventHandlers(sess) {
         const errMsg = `Error: ${event.data.message || event.data.errorType || "Unknown error"}`;
         const chatIds = getAllowedChatIds();
         for (const chatId of chatIds) {
-            enqueue(() => sendMessage(chatId, errMsg));
+            enqueueBestEffort(() => sendMessage(chatId, errMsg), "session-error-message");
         }
     });
 
@@ -1285,16 +1348,16 @@ function setupEventHandlers(sess) {
                 const bytes = Math.ceil(block.data.length * 3 / 4);
                 if (bytes > MAX_PHOTO_BYTES) {
                     for (const chatId of chatIds) {
-                        enqueue(() => sendMessage(chatId, "(Image too large for Telegram, >10MB)"));
+                        enqueueBestEffort(() => sendMessage(chatId, "(Image too large for Telegram, >10MB)"), "large-image-warning");
                     }
                     continue;
                 }
                 for (const chatId of chatIds) {
                     if (PHOTO_MIMES.has(block.mimeType)) {
-                        enqueue(() => sendPhoto(chatId, block.data, block.mimeType));
+                        enqueueBestEffort(() => sendPhoto(chatId, block.data, block.mimeType), "tool-image-photo");
                     } else {
                         const ext = block.mimeType.split("/")[1] || "bin";
-                        enqueue(() => sendDocument(chatId, block.data, block.mimeType, `image.${ext}`));
+                        enqueueBestEffort(() => sendDocument(chatId, block.data, block.mimeType, `image.${ext}`), "tool-image-document");
                     }
                 }
             }
@@ -1321,7 +1384,7 @@ function createUserInputHandler() {
             const chunks = chunkMessage(questionText);
             for (const chatId of chatIds) {
                 for (const chunk of chunks) {
-                    enqueue(() => sendFormattedMessage(chatId, chunk));
+                    enqueueBestEffort(() => sendFormattedMessage(chatId, chunk), "ask-user-question");
                 }
             }
 
@@ -1409,7 +1472,7 @@ async function handleConnect(name, sessionId, { takeover = false } = {}) {
         return;
     }
 
-    // Check lock -- if another live session holds it, take over (Telegram 409 will release them)
+    // Check lock before token validation, then re-check before claiming to avoid racing another session.
     const lock = readLock(name);
     const staleLock = lock && isLockStale(lock) ? lock : null;
     const takeoverRequested = takeover;
@@ -1444,6 +1507,18 @@ async function handleConnect(name, sessionId, { takeover = false } = {}) {
 
     // Claim lock and connect
     mkdirSync(botDir(name), { recursive: true });
+    const latestLock = readLock(name);
+    if (latestLock && !isLockStale(latestLock) && latestLock.sessionId !== sessionId) {
+        if (!takeoverRequested) {
+            botToken = null;
+            botInfo = null;
+            await session.log(
+                `Bot '${name}' was claimed by session ${latestLock.sessionId} while connecting. Run \`/telegram connect ${name} --takeover\` to replace it.`
+            );
+            return;
+        }
+        tookOverFrom = latestLock.sessionId;
+    }
     if (staleLock?.sessionId) {
         await session.log(`Replacing stale Telegram bridge lock from session ${staleLock.sessionId}.`);
     }
@@ -1481,7 +1556,7 @@ async function handleConnect(name, sessionId, { takeover = false } = {}) {
         } else {
             await session.log(`Telegram bridge connected (@${botInfo.username}).`);
             for (const chatId of chatIds) {
-                enqueue(() => sendMessage(chatId, "Copilot CLI session connected."));
+                enqueueBestEffort(() => sendMessage(chatId, "Copilot CLI session connected."), "connect-notification");
             }
         }
     }
@@ -1502,6 +1577,8 @@ async function releaseBridge(reason = "disconnect", notify = true) {
     const chatIds = getAllowedChatIds();
     resetStreamDraftState();
     stopTyping();
+    activePrompt = null;
+    stopPromptWatchdogIfIdle();
     if (notify && botToken) {
         const goodbyePromises = chatIds.map(chatId =>
             enqueue(() => sendMessage(chatId, "Copilot CLI session disconnected.").catch(() => {}))
@@ -1519,8 +1596,6 @@ async function releaseBridge(reason = "disconnect", notify = true) {
     currentBotName = null;
     currentSessionId = null;
     state = null;
-    activePrompt = null;
-    stopPromptWatchdogIfIdle();
 }
 
 async function handleDisconnect(sessionId) {

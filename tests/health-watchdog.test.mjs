@@ -8,6 +8,7 @@ test('bridge defines health.json path and stale watchdog constants', () => {
   assert.match(src, /function botHealthPath\(name\)/);
   assert.match(src, /PROMPT_STALE_AFTER_MS\s*=\s*15 \* 60 \* 1000/);
   assert.match(src, /MAX_TYPING_SESSION_MS\s*=\s*30 \* 60 \* 1000/);
+  assert.match(src, /PROGRESS_NOTICE_AFTER_MS\s*=\s*10 \* 60 \* 1000/);
 });
 
 test('inbound prompts start and clear an active prompt lifecycle', () => {
@@ -22,6 +23,8 @@ test('inbound prompts start and clear an active prompt lifecycle', () => {
 test('watchdog stops typing and reports a stalled Copilot session', () => {
   assert.match(src, /function ensurePromptWatchdog\(\)/);
   assert.match(src, /function checkPromptWatchdog\(\)/);
+  assert.match(src, /function maybeSendProgressNotice\(promptAge, promptActivityAge\)/);
+  assert.match(src, /Still working/);
   assert.match(src, /Copilot appears stuck/);
   assert.match(src, /stopTyping\(\)/);
 });
@@ -46,6 +49,8 @@ test('non-response paths clear active prompt and typing state', () => {
 });
 
 test('child assistant events still count as Copilot activity without clearing prompt', () => {
-  assert.match(src, /sess\.on\("assistant\.message", async \(event\) => \{\s*if \(!connected\) return;\s*recordCopilotEvent\("assistant\.message"\);\s*if \(event\.data\.parentToolCallId\) return;/);
-  assert.match(src, /sess\.on\("assistant\.message_delta", \(event\) => \{\s*if \(!connected\) return;\s*recordCopilotEvent\("assistant\.message_delta"\);\s*if \(event\.data\.parentToolCallId\) return;/);
+  assert.match(src, /function isChildAssistantEvent\(event\)/);
+  assert.match(src, /event\?\.agentId \|\| event\?\.data\?\.agentId \|\| event\?\.data\?\.parentToolCallId/);
+  assert.match(src, /sess\.on\("assistant\.message", async \(event\) => \{\s*if \(!connected\) return;\s*recordCopilotEvent\("assistant\.message"\);\s*if \(isChildAssistantEvent\(event\)\) return;/);
+  assert.match(src, /sess\.on\("assistant\.message_delta", \(event\) => \{\s*if \(!connected\) return;\s*recordCopilotEvent\("assistant\.message_delta"\);\s*if \(isChildAssistantEvent\(event\)\) return;/);
 });
