@@ -76,6 +76,12 @@ A GitHub Copilot CLI extension that bridges Telegram messages bidirectionally wi
 
 While Copilot is generating a response, the bridge streams `assistant.message_delta` events to Telegram by creating a draft message and editing it at a throttled pace. This avoids a long-lived `typing...` indicator with no visible progress. When Copilot emits the final `assistant.message`, the bridge replaces the draft with the final first chunk and sends any remaining chunks as follow-up messages.
 
+### Health snapshots and stalled-session watchdog
+
+While connected, the bridge writes `bots/<name>/health.json` with polling freshness, recent Telegram/Copilot activity, active prompt state, typing state, and a `likelyState` summary. `/telegram status <name>` shows the same health block.
+
+If a Telegram prompt is active but Copilot emits no assistant, tool, or session events for about 8 minutes, the bridge stops the typing indicator and sends a stalled-session warning instead of pretending everything is fine. The Telegram typing indicator is also capped at about 10 minutes, even if Copilot is still busy.
+
 ## Multiple Bots
 
 You can register as many bots as you want with `/telegram setup`. Each Copilot CLI session connects to one bot at a time, but multiple sessions can run different bots simultaneously.
@@ -88,7 +94,7 @@ Access control is shared -- pairing with any bot grants access to all bots manag
 
 - **Extension not loading** -- make sure you enabled the EXTENSIONS feature flag (`/experimental` in the CLI). Then verify the file exists at `~/.copilot/extensions/copilot-cli-telegram-bridge/extension.mjs`
 - **Bot not responding** -- check that the token is valid. Try `/telegram disconnect` then `/telegram connect` again
-- **The response appears stuck on typing** -- recent bridge versions stream assistant deltas into an edited draft message. If you still only see typing, Copilot may be blocked on a CLI permission prompt rather than generating text. Check the Copilot terminal for an approval picker.
+- **The response appears stuck on typing** -- recent bridge versions stream assistant deltas into an edited draft message and write `bots/<name>/health.json`. Run `/telegram status <name>` and check the Health block. If an active prompt has no Copilot activity for about 8 minutes, the bridge will stop typing and send a stalled-session warning. If you still only see typing before that window, Copilot may be blocked on a CLI permission prompt rather than generating text. Check the Copilot terminal for an approval picker.
 - **Startup fails with `Extension "unknown" was denied permission access`** -- newer Copilot CLI builds may require explicit permission for extensions that participate in permission handling. Start Copilot CLI with `--allow-tool extension-permission-access` and then reconnect with `/telegram connect <name>`.
 - **Pairing code expired** -- codes expire after 5 minutes. Send a new message to the bot to get a fresh one
 - **"Another session has this bot"** -- the bot is locked by another CLI session. Reconnect with `/telegram connect <name> --takeover` only if you intentionally want to replace that active session.
